@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "métrodoku — rareté des archives",
+  "version": "1.0.0",
+  "description": "Affiche les pourcentages de rareté par station sur les grilles archivées de métrodoku (après révélation des solutions). Lecture seule.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://metrodoku.fr/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "host_permissions": [
+    "https://metrodoku.fr/*"
+  ]
+}
