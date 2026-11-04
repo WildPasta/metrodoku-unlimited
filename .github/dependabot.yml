@@ -1,0 +1,17 @@
+# Dependabot keeps CI dependencies current. The GitHub Actions ecosystem
+# covers the SHA-pinned actions in .github/workflows/release.yml — Dependabot
+# updates the commit SHA and the "# vX.Y.Z" version comment together, so the
+# pinning strategy stays auditable. All action bumps are grouped into a single
+# weekly PR to keep noise low.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
