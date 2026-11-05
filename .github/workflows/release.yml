@@ -67,8 +67,17 @@ jobs:
         run: |
           mkdir -p dist
           ZIP="dist/metrodoku-unlimited-${{ steps.manifest.outputs.version }}.zip"
-          zip -X "$ZIP" manifest.json content.js \
-            icons/icon16.png icons/icon48.png icons/icon128.png
+          # Pack exactly what the manifest references: a hardcoded list drifts.
+          FILES=$(node -e '
+            const m = require("./manifest.json");
+            const files = new Set([
+              ...Object.values(m.icons || {}),
+              ...(m.content_scripts || []).flatMap((cs) => [...(cs.js || []), ...(cs.css || [])]),
+              ...(m.background && m.background.service_worker ? [m.background.service_worker] : []),
+            ]);
+            console.log([...files].join(" "));
+          ')
+          zip -X "$ZIP" manifest.json $FILES
           unzip -l "$ZIP"
 
       - name: Create GitHub release with the package
