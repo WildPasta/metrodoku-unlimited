@@ -1,3 +1,14 @@
 # Changelog
 
-- **1.0.0** - version initiale : tri de la modale solutions ignorant les enfants non-`.solutions-item` (plus de risque de boucle de mutations infinie) ; annotation des lignes auto-réparable après `resetDom` (plus de pourcentages périmés via `data-mxd-annotated`) ; détection de navigation SPA par sondage de l'URL chaque seconde (fiable, indépendante du DOM) ; suppression de la permission hôte Supabase, inutilisée en MV3.
+## 1.1.0 — le score arrive sur les archives
+
+- le score se met à jour en direct à chaque réponse, comme sur la grille du jour
+- l'écran de fin de partie affiche le vrai score, plus le « 0/900 » figé
+- mêmes règles que le site : rareté des réponses, +15 par bonne réponse, −20 par erreur, maximum 900
+
+## 1.0.0 — première version
+
+- badges de rareté sur chaque case validée, en plein jeu ou après révélation
+- pourcentages par station dans la modale solutions, triés de la plus commune à la plus rare
+- une note discrète pour les dates sans statistiques
+- une seule permission : le site métrodoku.fr

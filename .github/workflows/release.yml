@@ -1,11 +1,11 @@
-# Builds the Chrome Web Store package (ZIP with manifest.json at its root)
-# and attaches it to a GitHub Release whenever a version tag (v*.*.*) is
-# pushed. The tag must match the "version" field of manifest.json, and the
-# manifest's file references (icons, content scripts) must all exist.
+# Release pipeline: a version tag (v*.*.*) builds the Chrome Web Store ZIP
+# (manifest.json at zip root — the tag must match manifest "version"), attaches
+# it to a GitHub Release, and uploads it to the store when the CWS_* secrets
+# exist (Settings > Secrets; OAuth per
+# https://developer.chrome.com/docs/webstore/using-api, plus
+# CWS_EXTENSION_ID and CWS_PUBLISHER_ID from the Developer Dashboard).
 #
-# Usage:
-#   git tag v1.0.0
-#   git push origin v1.0.0
+# Usage: git tag v1.1.0 && git push origin v1.1.0
 
 name: release
 
@@ -17,13 +17,17 @@ on:
 permissions:
   contents: write
 
+env:
+  # Self-gate for the store-upload step: secrets are unreadable in `if`, env is.
+  CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+
 jobs:
   store-package:
     name: Build store package and create release
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Read manifest version
         id: manifest
@@ -68,8 +72,22 @@ jobs:
           unzip -l "$ZIP"
 
       - name: Create GitHub release with the package
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           name: "v${{ steps.manifest.outputs.version }}"
           generate_release_notes: true
           files: dist/*.zip
+
+      # Upload + submit for review. Runs only once the CWS_* secrets exist.
+      # The API cannot create items (one manual dashboard upload first), and
+      # it fails while the previous version is still in review — re-run then.
+      - name: Upload to Chrome Web Store
+        if: ${{ env.CWS_CLIENT_ID != '' }}
+        uses: mnao305/chrome-extension-upload@f549d5d654694a7722d6abfa64c97409ad5e64c1 # v7.0.0
+        with:
+          file-path: dist/metrodoku-unlimited-${{ steps.manifest.outputs.version }}.zip
+          extension-id: ${{ secrets.CWS_EXTENSION_ID }}
+          publisher-id: ${{ secrets.CWS_PUBLISHER_ID }}
+          client-id: ${{ secrets.CWS_CLIENT_ID }}
+          client-secret: ${{ secrets.CWS_CLIENT_SECRET }}
+          refresh-token: ${{ secrets.CWS_REFRESH_TOKEN }}
