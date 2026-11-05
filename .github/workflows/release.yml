@@ -1,20 +1,11 @@
-# Builds the Chrome Web Store package (ZIP with manifest.json at its root)
-# and attaches it to a GitHub Release whenever a version tag (v*.*.*) is
-# pushed. The tag must match the "version" field of manifest.json, and the
-# manifest's file references (icons, content scripts) must all exist.
+# Release pipeline: a version tag (v*.*.*) builds the Chrome Web Store ZIP
+# (manifest.json at zip root — the tag must match manifest "version"), attaches
+# it to a GitHub Release, and uploads it to the store when the CWS_* secrets
+# exist (Settings > Secrets; OAuth per
+# https://developer.chrome.com/docs/webstore/using-api, plus
+# CWS_EXTENSION_ID and CWS_PUBLISHER_ID from the Developer Dashboard).
 #
-# Optionally, after publishing the release, the package is uploaded to the
-# Chrome Web Store (upload + submit for review). This step is self-gating:
-# it only runs when the CWS_CLIENT_ID secret is configured. Required secrets
-# (repo Settings > Secrets and variables > Actions):
-#   CWS_CLIENT_ID, CWS_CLIENT_SECRET, CWS_REFRESH_TOKEN  (OAuth, see
-#     https://developer.chrome.com/docs/webstore/using-api)
-#   CWS_EXTENSION_ID  (from the Developer Dashboard item page)
-#   CWS_PUBLISHER_ID  (Dashboard > Publisher > Settings)
-#
-# Usage:
-#   git tag v1.0.0
-#   git push origin v1.0.0
+# Usage: git tag v1.1.0 && git push origin v1.1.0
 
 name: release
 
@@ -27,8 +18,7 @@ permissions:
   contents: write
 
 env:
-  # Lets the store-upload step self-gate: secrets are not readable in `if`,
-  # but workflow-level env is. Empty until the CWS secrets are configured.
+  # Self-gate for the store-upload step: secrets are unreadable in `if`, env is.
   CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
 
 jobs:
@@ -88,12 +78,9 @@ jobs:
           generate_release_notes: true
           files: dist/*.zip
 
-      # Uploads the same ZIP to the Chrome Web Store and submits it for
-      # review (publish defaults to true). Skipped automatically until the
-      # CWS_* secrets exist. Note: the API can only update an existing store
-      # item — create it with one manual dashboard upload first. If the
-      # previous version is still in review, this step fails: re-run the job
-      # once the review completes.
+      # Upload + submit for review. Runs only once the CWS_* secrets exist.
+      # The API cannot create items (one manual dashboard upload first), and
+      # it fails while the previous version is still in review — re-run then.
       - name: Upload to Chrome Web Store
         if: ${{ env.CWS_CLIENT_ID != '' }}
         uses: mnao305/chrome-extension-upload@f549d5d654694a7722d6abfa64c97409ad5e64c1 # v7.0.0

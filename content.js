@@ -1,21 +1,15 @@
 /*
- * métrodoku archive rarity — content script (Manifest V3).
+ * Metrodoku Unlimited - Content Script (Manifest V3)
  *
- * Read-only companion for https://metrodoku.fr/?archive-date=YYYY-MM-DD pages.
- * After the site reveals the solutions (game over), it annotates:
- *   - each answered grid cell with the rarity % of the station played there,
- *   - each station row of the per-cell solutions modal with its %, reordered
- *     most-common-first (rarest last; stable ties, unknown stations bottom).
- * Since v0.1.1, the cell badge also appears LIVE in archive mode: as soon as
- * the site validates a placement (cell gains .correct + data-station-id), the
- * badge is injected from the cached snapshot distribution — parity with the
- * site's native daily behavior (the site itself reserves no rarity badge in
- * archive mode: shouldShowRarityUi() returns false there).
+ * Read-only companion for https://metrodoku.fr/?archive-date=YYYY-MM-DD pages:
+ * rarity badges on validated cells, percentages in the solutions modal (sorted
+ * most-common-first), and the "score d'originalité" restored — the site
+ * computes it in archive mode but hides it; we port its exact formulas
+ * (app.js v=20260515-1) on top of the cached snapshot.
  *
- * Privacy: the publishable key is discovered per-run from the site's own
- * js/config.js and kept in memory only. Nothing is persisted; the only
- * network calls are the same-origin config.js/stations.json fetches and one
- * read-only RPC per archive date.
+ * Privacy: the Supabase publishable key is read per-run from the site's own
+ * js/config.js and kept in memory only. Network calls: two same-origin
+ * fetches (config.js, stations.json) and one read-only RPC per archive date.
  */
 (() => {
     "use strict";
@@ -26,13 +20,23 @@
     const STATIONS_PATH = "data/stations.json";
     const NOTE_TEXT = "pas de statistiques pour cette date";
 
-    // Centralised selectors (site-refactor tripwire: if these break, we no-op loudly, never mis-inject).
+    // Score d'originalité — verbatim from app.js v=20260515-1 and config.js
+    // (MAX_WRONG_ANSWERS is re-read per-run from config.js; fallback in step).
+    const SCORE_BONUS_PER_CORRECT_ANSWER = 15;
+    const SCORE_PENALTY_PER_MISTAKE = 20;
+    const FALLBACK_MAX_WRONG_ANSWERS = 3;
+    // storage.js saveGameState() key format for archive games.
+    const ARCHIVE_STATE_PREFIX = "metrodoku:archive:";
+    const SCORE_HEADER_DISPLAY_ID = "score-display";
+    const SCORE_HEADER_VALUE_ID = "score-value";
+    const SCORE_ENDGAME_VALUE_ID = "endgame-score-value";
+    const SCORE_ENDGAME_CARD_SELECTOR = ".endgame-stat-card";
+
+    // Site-refactor tripwire: if these break, we no-op loudly, never mis-inject.
     const SELECTORS = {
-        // Validation marker set by the site's setAnsweredCell (app.js):
-        // cell.classList.add("correct"); cell.dataset.stationId = station.id;
-        // then cell.disabled = true. Same code path for daily and archive
-        // games; ".grid.solution-mode" is only added later, at game over
-        // (app.js grid refresh), so it must NOT gate live badges.
+        // Set only by setAnsweredCell (validation + resume), never by the
+        // game-over reveal — exactly the player's validated answers. Do not
+        // gate on solution-mode: it appears only at game over.
         cell: "button.cell.correct[data-station-id]",
         answerCard: ".answer-card",
         solutionsList: "#solutions-list",
@@ -45,13 +49,14 @@
     const NOTE_ID = "mxd-archive-rarity-note";
 
     const state = {
-        config: null, // {url, key} — memory only, never persisted
+        config: null, // {url, key, maxWrongAnswers} — memory only, never persisted
         stationsById: null, // Map<id, nom>
         stationIdByName: null, // Map<nom, id>
         snapshots: new Map(), // dateKey -> {status: "ok"|"empty", stats}
         current: null, // {dateKey, snapshot}
         lastCellKey: null, // cell key whose solutions modal was last opened
         bootToken: 0, // guards against stale async boots on SPA navigation
+        wrongFlashCount: 0, // fallback mistake tracker (localStorage unreadable)
     };
 
     // ------------------------------------------------------------------ utils
@@ -96,8 +101,7 @@
         if (document.getElementById(STYLE_ID)) return;
         const style = document.createElement("style");
         style.id = STYLE_ID;
-        // Visuals mirror the site's own .answer-rarity-badge / .solutions-item-percentage
-        // (styles/grid.css, styles/modals.css) with fallbacks for the CSS variables.
+        // Visuals mirror the site's .answer-rarity-badge / .solutions-item-percentage styles.
         style.textContent = [
             ".mxd-cell-badge {",
             "    display: flex; align-items: center; justify-content: center;",
@@ -139,7 +143,14 @@
                 const url = text.match(/SUPABASE_URL\s*=\s*["']([^"']+)["']/);
                 const key = text.match(/SUPABASE_PUBLISHABLE_KEY\s*=\s*["']([^"']+)["']/);
                 if (!url || !key) throw new Error("config.js parse failed");
-                state.config = { url: url[1].replace(/\/+$/, ""), key: key[1] };
+                // MAX_WRONG_ANSWERS (score penalty cap) lives in the same config.js;
+                // keep the known default if the site renames it.
+                const maxWrong = text.match(/MAX_WRONG_ANSWERS\s*=\s*(\d+)/);
+                state.config = {
+                    url: url[1].replace(/\/+$/, ""),
+                    key: key[1],
+                    maxWrongAnswers: maxWrong ? Number(maxWrong[1]) : FALLBACK_MAX_WRONG_ANSWERS,
+                };
                 return state.config;
             });
     }
@@ -220,13 +231,9 @@
 
     // ------------------------------------------------------------- decoration
 
-    // One idempotent badge builder shared by BOTH trigger paths: the live
-    // archive path (cell just became .correct[data-station-id] mid-game) and
-    // the solution-mode path (post-gameover re-annotation). Only injects from
-    // the cached snapshot distribution — never invents numbers (a station
-    // absent from the distribution gets no badge), never touches a cell the
-    // site has not validated, and never duplicates (a card that already
-    // carries a badge is left untouched).
+    // Idempotent badge builder, shared by the live path (cell just validated
+    // mid-game) and the game-over pass. Only site-validated cells, only real
+    // distribution numbers — a station absent from the snapshot gets no badge.
     function ensureCellBadge(cell) {
         const current = state.current;
         if (!current || !current.snapshot || current.snapshot.status !== "ok") return;
@@ -245,24 +252,17 @@
         card.prepend(badge);
     }
 
-    // Annotate every validated cell. In archive mode the MutationObserver
-    // fires the moment the site marks a cell .correct, so the badge appears
-    // immediately on validation; at game over the same function re-runs over
-    // all answered cells and is a no-op for already-badged ones (no dupes).
+    // Observer-driven: runs the moment a cell validates, and again over all
+    // answered cells at game over (no-op on already-badged ones).
     function decorateCells() {
         safe(() => {
             document.querySelectorAll(SELECTORS.cell).forEach(ensureCellBadge);
         }, "decorateCells");
     }
 
-    // Percentages on each station row of the per-cell solutions modal.
-    // Rows expose only the station *name*, so ids are matched via stations.json.
-    // Rows are then reordered in the same decorated pass: most common first,
-    // rarest last. Stations with no computable percentage (absent from the
-    // distribution) keep their native relative order at the bottom, and the
-    // sort is stable — ties keep the site's native relative order (index
-    // tiebreak). appendChild moves are no-ops on an already-sorted list, so
-    // repeated passes (modal re-scopes per cell) stay idempotent.
+    // Per-cell solutions modal: rows expose only the station *name*, so ids
+    // come from stations.json. Rows get a % and are re-sorted most-common-first
+    // (stable ties; unknown stations keep native order at the bottom).
     function decorateSolutionsModal() {
         safe(() => {
             const current = state.current;
@@ -301,13 +301,11 @@
                     return (pb - pa) || (a.index - b.index); // descending, stable
                 })
                 .map((entry) => entry.item);
-            // Only move nodes when the order actually differs: browsers fire
-            // childList mutation records even for no-op appendChild moves, and
-            // re-decorating on those records would loop forever. Compare against
-            // the .solutions-item children only — desiredOrder never contains
-            // other nodes (headers, empty states…), so a raw children comparison
-            // would be permanently unequal and appendChild on every mutation
-            // batch would self-sustain an infinite mutation loop.
+            // Move only when the order actually differs (appendChild fires
+            // mutation records even for no-op moves → infinite re-decorate
+            // loop otherwise), and compare against .solutions-item children
+            // only: desiredOrder never holds other nodes (headers…), so a
+            // raw children list would never match.
             const currentItems = Array.from(list.children).filter((child) => child.matches(SELECTORS.solutionsItem));
             const needsMove = currentItems.length !== desiredOrder.length
                 || currentItems.some((child, i) => child !== desiredOrder[i]);
@@ -319,6 +317,166 @@
         injectStyleOnce();
         decorateCells();
         decorateSolutionsModal();
+        updateScoreDisplays();
+    }
+
+    // ------------------------------------------------- score d'originalité
+    // Port of the site's own scoring (app.js v=20260515-1: getScoreSummary,
+    // getAnswerScore and friends). The site computes it for archives too but
+    // hides the UI (shouldShowRarityUi() → false), so we recompute the same
+    // number from the cached snapshot and feed the site's own displays.
+
+    function roundScore(value) {
+        return Math.round(value * 10) / 10;
+    }
+
+    function formatScoreValue(value) {
+        if (Math.abs(value - Math.round(value)) < 0.001) {
+            return String(Math.round(value));
+        }
+
+        return value.toLocaleString("fr-FR", {
+            minimumFractionDigits: 1,
+            maximumFractionDigits: 1
+        });
+    }
+
+    // buildScoreLabel() (app.js): the total is rounded to an integer for display.
+    function buildScoreLabel(score, maxScore) {
+        return `${formatScoreValue(Math.round(score))}/${formatScoreValue(maxScore)}`;
+    }
+
+    function getMaxWrongAnswers() {
+        const value = state.config ? Number(state.config.maxWrongAnswers) : NaN;
+        return Number.isFinite(value) && value > 0 ? value : FALLBACK_MAX_WRONG_ANSWERS;
+    }
+
+    // The site persists archive games in localStorage under
+    // `metrodoku:archive:<dateKey>` (version 1) with a `remainingMistakes`
+    // countdown: mistakesMade = MAX − remaining.
+    function readPersistedArchiveState(dateKey) {
+        return safe(() => {
+            const raw = window.localStorage.getItem(ARCHIVE_STATE_PREFIX + dateKey);
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            if (!parsed || parsed.version !== 1 || parsed.dateKey !== dateKey) return null;
+            if (!Array.isArray(parsed.answers)) return null;
+            return parsed;
+        }, "readPersistedArchiveState") || null;
+    }
+
+    function countMistakes(dateKey) {
+        const max = getMaxWrongAnswers();
+        const persisted = readPersistedArchiveState(dateKey);
+        if (persisted && Number.isFinite(Number(persisted.remainingMistakes))) {
+            const remaining = Math.min(Math.max(Number(persisted.remainingMistakes), 0), max);
+            return max - remaining;
+        }
+        // localStorage unavailable: fall back to the live wrong-flash tracker.
+        return state.wrongFlashCount;
+    }
+
+    // Validated answers. Preferred: the site's persisted records
+    // ({rowId, columnId, stationId, scoreValue?}). Fallback: validated DOM
+    // cells — the game-over reveal never marks them, so they are exactly the
+    // player's answers (no stored scoreValue → computed from the snapshot).
+    function collectValidatedAnswers(dateKey) {
+        const persisted = readPersistedArchiveState(dateKey);
+        if (persisted) {
+            return persisted.answers.filter((record) => record && record.rowId && record.columnId && record.stationId != null);
+        }
+        return safe(() => Array.from(document.querySelectorAll(SELECTORS.cell)).map((cell) => ({
+            rowId: cell.dataset.row,
+            columnId: cell.dataset.col,
+            stationId: cell.dataset.stationId,
+        })), "collectValidatedAnswers.dom") || [];
+    }
+
+    // getAnswerScore() port (stored scoreValue handled by the caller): rank
+    // score over the cell's snapshot distribution — N = station-set size
+    // (verified live: map == the cell's possible answers, all isComplete),
+    // strict < so ties share rank; rarest → 100, most common → 100/N. Like
+    // the site, this never returns null: absent station → weight 0 → 100,
+    // unusable stats → flat 100 (the site's terminal fallback).
+    function computeAnswerScore(cellStats, stationId) {
+        const stations = cellStats && cellStats.stations ? cellStats.stations : null;
+        if (!stations || Object.keys(stations).length === 0) {
+            return 100; // site terminal fallback (no usable cell stats)
+        }
+        if (Object.prototype.hasOwnProperty.call(stations, stationId)) {
+            const n = Object.keys(stations).length;
+            const targetCount = Number(stations[stationId]) || 0;
+            const betterRanksCount = Object.keys(stations).reduce((count, id) => {
+                return (Number(stations[id]) || 0) < targetCount ? count + 1 : count;
+            }, 0);
+            const rank = betterRanksCount + 1;
+            return roundScore((100 * (n - rank + 1)) / n);
+        }
+        // Absent from the distribution: weight 0 → maximally rare → 100.
+        return 100;
+    }
+
+    // getScoreSummary() port: Σ per-answer scores (stored scoreValue wins),
+    // +15 per validated cell, −20 per mistake, clamped to [0, cells × 100].
+    function computeScoreSummary() {
+        const current = state.current;
+        if (!current || !current.snapshot || current.snapshot.status !== "ok") return null;
+        const stats = current.snapshot.stats;
+        const answers = collectValidatedAnswers(current.dateKey);
+        const mistakes = countMistakes(current.dateKey);
+        const maxScore = Object.keys(stats).length * 100;
+        let baseScore = 0;
+        answers.forEach((record) => {
+            const cellStats = stats[`${record.rowId}:${record.columnId}`];
+            // JSON null/"" means "not locked": recompute (Number(null) === 0
+            // would silently zero it).
+            const raw = record.scoreValue;
+            const stored = raw == null || raw === "" ? NaN : Number(raw);
+            const score = Number.isFinite(stored)
+                ? roundScore(stored)
+                : computeAnswerScore(cellStats, String(record.stationId));
+            if (score != null) baseScore += score;
+        });
+        const bonus = answers.length * SCORE_BONUS_PER_CORRECT_ANSWER;
+        const penalty = mistakes * SCORE_PENALTY_PER_MISTAKE;
+        const score = Math.min(maxScore, Math.max(0, baseScore + bonus - penalty));
+        return { score: roundScore(score), maxScore, mistakes };
+    }
+
+    // Guarded writes only (skip if the node already carries the value): the
+    // site's refreshScoreDisplays() re-hides and empties the displays on
+    // archive pages, and unguarded writes would ping-pong mutations forever.
+    function updateScoreDisplays() {
+        safe(() => {
+            const summary = computeScoreSummary();
+            if (!summary) return;
+            const label = buildScoreLabel(summary.score, summary.maxScore);
+            const display = document.getElementById(SCORE_HEADER_DISPLAY_ID);
+            if (display && display.hidden) display.hidden = false;
+            const value = document.getElementById(SCORE_HEADER_VALUE_ID);
+            if (value && value.textContent !== label) value.textContent = label;
+            const endgameValue = document.getElementById(SCORE_ENDGAME_VALUE_ID);
+            if (endgameValue) {
+                const card = endgameValue.closest(SCORE_ENDGAME_CARD_SELECTOR);
+                if (card && card.hidden) card.hidden = false;
+                if (endgameValue.textContent !== label) endgameValue.textContent = label;
+            }
+        }, "updateScoreDisplays");
+    }
+
+    // Fallback mistake tracker (localStorage unreadable): counts wrong-flash
+    // class transitions absent → present. The site's remove+re-add restart
+    // yields exactly one transition per flash; the timeout's later removal
+    // (oldValue already has the class) is not counted.
+    function countWrongFlashes(mutations) {
+        (mutations || []).forEach((mutation) => {
+            if (!mutation || mutation.type !== "attributes" || mutation.attributeName !== "class") return;
+            const target = mutation.target;
+            if (!target || !target.classList || !target.classList.contains("wrong-flash")) return;
+            const oldValue = String(mutation.oldValue || "");
+            if (oldValue.split(/\s+/).indexOf("wrong-flash") !== -1) return;
+            state.wrongFlashCount += 1;
+        });
     }
 
     // ------------------------------------------------------------- debug hook
@@ -342,6 +500,8 @@
                 });
             }
             window.__metrodokuArchiveStats = hook;
+            // Live score introspection (score d'originalité) — re-computed on call.
+            hook.scoreSummary = () => safe(() => computeScoreSummary(), "debugHook.scoreSummary") || null;
         }, "applyDebugHook");
     }
 
@@ -353,6 +513,7 @@
         state.bootToken += 1;
         state.current = null;
         state.lastCellKey = null;
+        state.wrongFlashCount = 0;
         resetDom();
         return dateKey != null;
     }
@@ -401,24 +562,23 @@
             }, "clickCapture");
         }, true);
 
-        // SPA navigation: date param changes without a full page load.
-        // pushState/replaceState fire no event a content script can observe
-        // (history monkey-patching cannot cross the isolated world), so poll
-        // the URL — deterministic and independent of DOM churn. The observer's
-        // handleNavChange call remains the instant path; this poll is the
-        // safety net, and it also covers back/forward (hence no popstate).
+        // SPA navigation: pushState fires no observable event from the
+        // isolated world, so poll the URL — the safety net behind the
+        // observer's instant path (also covers back/forward → no popstate).
         setInterval(() => {
             safe(() => {
                 if (handleNavChange()) run();
             }, "navPoll");
         }, 1000);
 
-        const observer = new MutationObserver(() => {
+        const observer = new MutationObserver((mutations) => {
             safe(() => {
+                countWrongFlashes(mutations);
                 if (handleNavChange()) run();
                 if (state.current && state.current.snapshot && state.current.snapshot.status === "ok") {
                     decorateCells();
                     decorateSolutionsModal();
+                    updateScoreDisplays();
                 }
             }, "observer");
         });
@@ -427,6 +587,7 @@
             childList: true,
             attributes: true,
             attributeFilter: ["class", "hidden"],
+            attributeOldValue: true,
         });
 
         run();
